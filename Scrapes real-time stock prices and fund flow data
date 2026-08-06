@@ -1,0 +1,448 @@
+"""
+Stock Price and Fund Flow Data Scraper
+Scrapes real-time stock prices and fund flow data from public Chinese financial APIs
+"""
+
+import requests
+import json
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import pandas as pd
+from dataclasses import dataclass
+from enum import Enum
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class MarketType(Enum):
+    """Market type enumeration"""
+    SH = "sh"  # Shanghai Stock Exchange
+    SZ = "sz"  # Shenzhen Stock Exchange
+
+
+@dataclass
+class StockPrice:
+    """Stock price data structure"""
+    symbol: str
+    name: str
+    price: float
+    previous_close: float
+    high: float
+    low: float
+    volume: int
+    amount: float
+    change: float
+    change_percent: float
+    timestamp: datetime
+
+
+@dataclass
+class FundFlow:
+    """Fund flow data structure"""
+    symbol: str
+    name: str
+    main_net_inflow: float
+    main_inflow_percent: float
+    large_order_inflow: float
+    medium_order_inflow: float
+    small_order_inflow: float
+    large_order_outflow: float
+    medium_order_outflow: float
+    small_order_outflow: float
+    timestamp: datetime
+
+
+class SinaFinanceAPI:
+    """Sina Finance API for real-time stock quotes"""
+    
+    BASE_URL = "https://hq.sinajs.cn/list="
+    
+    def __init__(self, timeout: int = 10):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    
+    def _format_symbol(self, symbol: str, market: MarketType) -> str:
+        """Format stock symbol for API request"""
+        return f"{market.value}{symbol}"
+    
+    def get_stock_price(self, symbol: str, market: MarketType = MarketType.SH) -> Optional[StockPrice]:
+        """
+        Fetch real-time stock price from Sina Finance API
+        
+        Args:
+            symbol: Stock code (e.g., "600000" for PFYH)
+            market: MarketType enum (SH or SZ)
+            
+        Returns:
+            StockPrice object or None if request fails
+        """
+        try:
+            formatted_symbol = self._format_symbol(symbol, market)
+            url = self.BASE_URL + formatted_symbol
+            
+            response = self.session.get(url, timeout=self.timeout)
+            response.encoding = 'gbk'
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to fetch {symbol}: HTTP {response.status_code}")
+                return None
+            
+            # Parse Sina Finance response format: var hq_str_sh600000="name,price,bid,ask,...";
+            lines = response.text.strip().split('\n')
+            for line in lines:
+                if 'var hq_str_' in line:
+                    # Extract data from JavaScript variable
+                    data = self._parse_sina_response(line, symbol, formatted_symbol)
+                    return data
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching stock price for {symbol}: {str(e)}")
+            return None
+    
+    def _parse_sina_response(self, line: str, symbol: str, formatted_symbol: str) -> Optional[StockPrice]:
+        """Parse Sina Finance response line"""
+        try:
+            # Extract the data string between quotes
+            start = line.find('"') + 1
+            end = line.rfind('"')
+            data_str = line[start:end]
+            
+            if not data_str:
+                return None
+            
+            parts = data_str.split(',')
+            if len(parts) < 11:
+                logger.warning(f"Insufficient data fields for {symbol}")
+                return None
+            
+            # Sina Finance format:
+            # name, price, bid, ask, volume, amount, time, date, status, ...
+            name = parts[0]
+            price = float(parts[1])
+            previous_close = float(parts[2])
+            high = float(parts[5])
+            low = float(parts[6])
+            volume = int(parts[8])
+            amount = float(parts[9])
+            
+            change = price - previous_close
+            change_percent = (change / previous_close * 100) if previous_close != 0 else 0
+            
+            return StockPrice(
+                symbol=symbol,
+                name=name,
+                price=price,
+                previous_close=previous_close,
+                high=high,
+                low=low,
+                volume=volume,
+                amount=amount,
+                change=change,
+                change_percent=change_percent,
+                timestamp=datetime.now()
+            )
+        except (ValueError, IndexError) as e:
+            logger.error(f"Error parsing Sina response for {symbol}: {str(e)}")
+            return None
+    
+    def get_multiple_stocks(self, symbols: List[Tuple[str, MarketType]]) -> List[StockPrice]:
+        """
+        Fetch prices for multiple stocks
+        
+        Args:
+            symbols: List of tuples (symbol, market)
+            
+        Returns:
+            List of StockPrice objects
+        """
+        results = []
+        formatted_symbols = [self._format_symbol(sym, market) for sym, market in symbols]
+        
+        try:
+            url = self.BASE_URL + ','.join(formatted_symbols)
+            response = self.session.get(url, timeout=self.timeout)
+            response.encoding = 'gbk'
+            
+            if response.status_code != 200:
+                return results
+            
+            lines = response.text.strip().split('\n')
+            for i, line in enumerate(lines):
+                if 'var hq_str_' in line and i < len(symbols):
+                    symbol, market = symbols[i]
+                    data = self._parse_sina_response(line, symbol, formatted_symbols[i])
+                    if data:
+                        results.append(data)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error fetching multiple stocks: {str(e)}")
+            return results
+
+
+class EastmoneyAPI:
+    """Eastmoney API for fund flow data"""
+    
+    BASE_URL = "https://vip.stock.finance.sina.com.cn/q/go.php/VInvestConsume/kind/"
+    FUND_FLOW_URL = "https://ff.eastmoney.com/EM_Finance2014NumericApplication/web/QueryStockFundFlowBySql"
+    
+    def __init__(self, timeout: int = 10):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://ff.eastmoney.com/'
+        })
+    
+    def get_fund_flow(self, symbol: str, market: MarketType = MarketType.SH) -> Optional[FundFlow]:
+        """
+        Fetch fund flow data from Eastmoney
+        
+        Args:
+            symbol: Stock code
+            market: MarketType enum
+            
+        Returns:
+            FundFlow object or None if request fails
+        """
+        try:
+            # Format code with market prefix
+            code = f"{market.value}{symbol}"
+            
+            params = {
+                "sql": f"select * from hq_stock_fund_flow where code='{code}' order by day desc limit 1",
+                "p": 1,
+                "pagesize": 1,
+                "sortTypes": -1,
+                "sortFields": "day",
+                "client": "web"
+            }
+            
+            response = self.session.get(
+                self.FUND_FLOW_URL,
+                params=params,
+                timeout=self.timeout
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to fetch fund flow for {symbol}: HTTP {response.status_code}")
+                return None
+            
+            data = response.json()
+            
+            if not data.get('result', {}).get('data'):
+                logger.warning(f"No fund flow data for {symbol}")
+                return None
+            
+            fund_data = data['result']['data'][0]
+            return self._parse_fund_flow(fund_data, symbol)
+            
+        except Exception as e:
+            logger.error(f"Error fetching fund flow for {symbol}: {str(e)}")
+            return None
+    
+    def _parse_fund_flow(self, data: Dict, symbol: str) -> Optional[FundFlow]:
+        """Parse fund flow response"""
+        try:
+            return FundFlow(
+                symbol=symbol,
+                name=data.get('name', ''),
+                main_net_inflow=float(data.get('moneyin', 0)) - float(data.get('moneyout', 0)),
+                main_inflow_percent=float(data.get('ratio', 0)),
+                large_order_inflow=float(data.get('b_ratio', 0)),
+                medium_order_inflow=float(data.get('c_ratio', 0)),
+                small_order_inflow=float(data.get('d_ratio', 0)),
+                large_order_outflow=float(data.get('e_ratio', 0)),
+                medium_order_outflow=float(data.get('f_ratio', 0)),
+                small_order_outflow=float(data.get('g_ratio', 0)),
+                timestamp=datetime.now()
+            )
+        except (ValueError, KeyError) as e:
+            logger.error(f"Error parsing fund flow data: {str(e)}")
+            return None
+    
+    def get_multiple_fund_flows(self, symbols: List[Tuple[str, MarketType]]) -> List[FundFlow]:
+        """
+        Fetch fund flow data for multiple stocks
+        
+        Args:
+            symbols: List of tuples (symbol, market)
+            
+        Returns:
+            List of FundFlow objects
+        """
+        results = []
+        for symbol, market in symbols:
+            flow = self.get_fund_flow(symbol, market)
+            if flow:
+                results.append(flow)
+            # Add delay to avoid rate limiting
+            time.sleep(0.5)
+        
+        return results
+
+
+class StockDataAggregator:
+    """Aggregates stock price and fund flow data"""
+    
+    def __init__(self):
+        self.sina_api = SinaFinanceAPI()
+        self.eastmoney_api = EastmoneyAPI()
+    
+    def get_stock_analysis(self, symbol: str, market: MarketType = MarketType.SH) -> Optional[Dict]:
+        """
+        Get combined stock price and fund flow analysis
+        
+        Args:
+            symbol: Stock code
+            market: MarketType enum
+            
+        Returns:
+            Dictionary with price and fund flow data
+        """
+        price_data = self.sina_api.get_stock_price(symbol, market)
+        flow_data = self.eastmoney_api.get_fund_flow(symbol, market)
+        
+        if not price_data:
+            logger.warning(f"Could not fetch price data for {symbol}")
+            return None
+        
+        return {
+            'price': price_data,
+            'fund_flow': flow_data,
+            'analysis_time': datetime.now().isoformat()
+        }
+    
+    def get_multiple_analyses(self, symbols: List[Tuple[str, MarketType]]) -> List[Dict]:
+        """
+        Get analysis for multiple stocks
+        
+        Args:
+            symbols: List of tuples (symbol, market)
+            
+        Returns:
+            List of analysis dictionaries
+        """
+        results = []
+        
+        # Fetch prices
+        prices = self.sina_api.get_multiple_stocks(symbols)
+        price_dict = {p.symbol: p for p in prices}
+        
+        # Fetch fund flows
+        flows = self.eastmoney_api.get_multiple_fund_flows(symbols)
+        flow_dict = {f.symbol: f for f in flows}
+        
+        # Combine data
+        for symbol, market in symbols:
+            if symbol in price_dict:
+                results.append({
+                    'price': price_dict[symbol],
+                    'fund_flow': flow_dict.get(symbol),
+                    'analysis_time': datetime.now().isoformat()
+                })
+        
+        return results
+    
+    def export_to_csv(self, analyses: List[Dict], filename: str = 'stock_analysis.csv'):
+        """
+        Export analysis results to CSV
+        
+        Args:
+            analyses: List of analysis dictionaries
+            filename: Output CSV filename
+        """
+        rows = []
+        for analysis in analyses:
+            price = analysis['price']
+            flow = analysis['fund_flow']
+            
+            row = {
+                'Symbol': price.symbol,
+                'Name': price.name,
+                'Price': price.price,
+                'Change': price.change,
+                'Change%': f"{price.change_percent:.2f}%",
+                'Volume': price.volume,
+                'Amount': f"{price.amount:.2f}",
+                'High': price.high,
+                'Low': price.low,
+            }
+            
+            if flow:
+                row.update({
+                    'Main_Net_Inflow': f"{flow.main_net_inflow:.2f}",
+                    'Main_Inflow_%': f"{flow.main_inflow_percent:.2f}%",
+                    'Large_Order_In': f"{flow.large_order_inflow:.2f}%",
+                    'Medium_Order_In': f"{flow.medium_order_inflow:.2f}%",
+                    'Small_Order_In': f"{flow.small_order_inflow:.2f}%",
+                })
+            
+            rows.append(row)
+        
+        df = pd.DataFrame(rows)
+        df.to_csv(filename, index=False, encoding='utf-8')
+        logger.info(f"Data exported to {filename}")
+
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize aggregator
+    aggregator = StockDataAggregator()
+    
+    # Example 1: Get single stock analysis
+    print("=" * 60)
+    print("Single Stock Analysis")
+    print("=" * 60)
+    
+    analysis = aggregator.get_stock_analysis("600000", MarketType.SH)  # Pudong Development Bank
+    if analysis:
+        price = analysis['price']
+        print(f"\nStock: {price.name} ({price.symbol})")
+        print(f"Price: ¥{price.price:.2f}")
+        print(f"Change: {price.change:+.2f} ({price.change_percent:+.2f}%)")
+        print(f"Volume: {price.volume:,}")
+        print(f"Amount: ¥{price.amount:,.2f}")
+        print(f"High/Low: ¥{price.high:.2f} / ¥{price.low:.2f}")
+        
+        if analysis['fund_flow']:
+            flow = analysis['fund_flow']
+            print(f"\nFund Flow:")
+            print(f"Main Net Inflow: ¥{flow.main_net_inflow:,.2f}")
+            print(f"Main Inflow %: {flow.main_inflow_percent:.2f}%")
+    
+    # Example 2: Get multiple stocks
+    print("\n" + "=" * 60)
+    print("Multiple Stocks Analysis")
+    print("=" * 60)
+    
+    stocks = [
+        ("600000", MarketType.SH),  # PFYH
+        ("600036", MarketType.SH),  # China Merchants Bank
+        ("000858", MarketType.SZ),  # Wuliangye Yiqu
+    ]
+    
+    analyses = aggregator.get_multiple_analyses(stocks)
+    
+    for analysis in analyses:
+        price = analysis['price']
+        print(f"\n{price.name}: ¥{price.price:.2f} ({price.change_percent:+.2f}%)")
+    
+    # Example 3: Export to CSV
+    print("\n" + "=" * 60)
+    print("Exporting to CSV")
+    print("=" * 60)
+    
+    if analyses:
+        aggregator.export_to_csv(analyses)
+        print("\nData successfully exported!")
